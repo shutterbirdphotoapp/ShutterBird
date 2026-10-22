@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="ShutterBird">
+<meta name="robots" content="noindex, nofollow">
+<title>ShutterBird Live</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; background: #000; color: #eee;
+    font: 15px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  #stage { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; }
+  video { width: 100%; height: 100%; object-fit: contain; background: #000; }
+  #overlay { position: fixed; left: 0; right: 0; top: 0; padding: calc(env(safe-area-inset-top) + 10px) 14px 10px;
+    display: flex; align-items: center; gap: 10px;
+    background: linear-gradient(rgba(0,0,0,.75), rgba(0,0,0,0)); pointer-events: none; }
+  #dot { width: 10px; height: 10px; border-radius: 50%; background: #888; flex: none; }
+  #dot.live { background: #ff3b30; box-shadow: 0 0 10px #ff3b30; }
+  #dot.wait { background: #ffcc00; }
+  #dot.off { background: #888; }
+  #status { font-weight: 600; letter-spacing: .2px; text-shadow: 0 1px 2px #000; }
+  #detail { font-size: 12px; color: #bbb; margin-left: auto; text-shadow: 0 1px 2px #000; }
+  #center { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center;
+    justify-content: center; gap: 14px; text-align: center; padding: 24px; }
+  #center.hidden { display: none; }
+  .big { font-size: 22px; font-weight: 700; }
+  .muted { color: #aaa; max-width: 32ch; line-height: 1.4; }
+  button { font: inherit; font-weight: 600; color: #fff; background: #0a84ff; border: 0; border-radius: 12px;
+    padding: 12px 20px; }
+  .spinner { width: 28px; height: 28px; border: 3px solid #333; border-top-color: #fff; border-radius: 50%;
+    animation: spin 1s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  #bottom { position: fixed; left: 0; right: 0; bottom: 0; padding: 10px 14px calc(env(safe-area-inset-bottom) + 10px);
+    font-size: 12px; color: #999; text-align: center; background: linear-gradient(rgba(0,0,0,0), rgba(0,0,0,.7)); }
+</style>
+</head>
+<body>
+<div id="stage"><video id="video" autoplay muted playsinline></video></div>
+<div id="overlay"><div id="dot" class="off"></div><div id="status">Starting…</div><div id="detail"></div></div>
+<div id="center">
+  <div class="spinner" id="spinner"></div>
+  <div class="big" id="centerTitle">Waking the camera…</div>
+  <div class="muted" id="centerText">The camera phone has been asked to start. This usually takes a few seconds.</div>
+  <button id="retry" style="display:none">Try again</button>
+</div>
+<div id="bottom"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/livekit-client@2.23.0/dist/livekit-client.umd.js"></script>
+<script>
+(function () {
+  'use strict';
+
+  // ---- Private link: everything after # (never sent to the web server) ----
+  const params = new URLSearchParams(location.hash.replace(/^#/, ''));
+  const livekitURL = params.get('u') || '';
+  const token = params.get('t') || '';
+  const topic = params.get('n') || '';
+  const ntfyServer = (params.get('s') || 'https://ntfy.sh').replace(/\/+$/, '');
+
+  const dot = document.getElementById('dot');
+  const statusEl = document.getElementById('status');
+  const detailEl = document.getElementById('detail');
+  const center = document.getElementById('center');
+  const centerTitle = document.getElementById('centerTitle');
+  const centerText = document.getElementById('centerText');
+  const spinner = document.getElementById('spinner');
+  const retryBtn = document.getElementById('retry');
+  const video = document.getElementById('video');
+  const bottom = document.getElementById('bottom');
+
+  const WAKE_RESEND_SECONDS = 25;     // repeat the wake-up while nothing has arrived (at most a few times)
+  const MAX_WAKE_RESENDS = 3;
+  const OFFLINE_AFTER_SECONDS = 90;   // give up waiting after this long
+
+  let room = null;
+  let haveVideo = false;
+  let wakeSends = 0;
+  let wakeTimer = null;
+  let offlineTimer = null;
+  let connecting = false;
+
+  function setStatus(kind, text, detail) {
+    dot.className = kind;
+    statusEl.textContent = text;
+    detailEl.textContent = detail || '';
+  }
+
+  function showCenter(title, text, opts) {
+    opts = opts || {};
+    center.classList.remove('hidden');
+    centerTitle.textContent = title;
+    centerText.textContent = text;
+    spinner.style.display = opts.spinner === false ? 'none' : '';
+    retryBtn.style.display = opts.retry ? '' : 'none';
+  }
+
+  function hideCenter() { center.classList.add('hidden'); }
+
+  if (!livekitURL || !token || !topic) {
+    setStatus('off', 'No private link');
+    showCenter('This page needs your private link',
+      'Open it from the link ShutterBird gave you (Settings → Live view → Copy private link). The address must include the part after #.',
+      { spinner: false });
+    return;
+  }
+  if (typeof LivekitClient === 'undefined') {
+    setStatus('off', 'Could not load the video library');
+    showCenter('Could not load the video library', 'Check the internet connection and reload.', { spinner: false, retry: true });
+    retryBtn.onclick = () => location.reload();
+    return;
+  }
+
+  const LK = LivekitClient;
+
+  // ---- Wake-up message to the camera phone (ntfy) ----
+  async function sendWake(reason) {
+    wakeSends++;
+    try {
+      await fetch(ntfyServer + '/' + encodeURIComponent(topic), {
+        method: 'POST',
+        body: 'start ' + reason,
+        headers: { 'Title': 'ShutterBird viewer', 'Priority': '3' }
+      });
+    } catch (e) {
+      console.warn('wake failed', e);
+    }
+  }
+
+  function scheduleWakeResend() {
+    clearTimeout(wakeTimer);
+    wakeTimer = setTimeout(() => {
+      if (haveVideo || document.visibilityState !== 'visible') return;
+      if (wakeSends < MAX_WAKE_RESENDS + 1) {
+        sendWake('again');
+        setStatus('wait', 'Waking the camera…', 'asked again');
+        scheduleWakeResend();
+      }
+    }, WAKE_RESEND_SECONDS * 1000);
+  }
+
+  function scheduleOffline() {
+    clearTimeout(offlineTimer);
+    offlineTimer = setTimeout(() => {
+      if (haveVideo) return;
+      setStatus('off', 'Camera offline');
+      showCenter('Camera offline',
+        'The camera phone did not answer. Check that ShutterBird is open on it, Live view is switched on, and it has Wi-Fi.',
+        { spinner: false, retry: true });
+      leaveRoom();
+    }, OFFLINE_AFTER_SECONDS * 1000);
+  }
+
+  // ---- LiveKit room ----
+  function attachTrack(track) {
+    if (track.kind !== 'video') return;
+    track.attach(video);
+    haveVideo = true;
+    clearTimeout(wakeTimer);
+    clearTimeout(offlineTimer);
+    hideCenter();
+    setStatus('live', 'Live', '');
+    video.play().catch(() => {});
+  }
+
+  function detachTrack(track) {
+    if (track.kind !== 'video') return;
+    track.detach(video);
+    haveVideo = false;
+    setStatus('wait', 'Camera stopped', 'waiting…');
+    showCenter('Camera stopped', 'Waiting for it to come back…');
+    scheduleOffline();
+  }
+
+  async function joinRoom() {
+    if (connecting || (room && room.state === LK.ConnectionState.Connected)) return;
+    connecting = true;
+    room = new LK.Room({ adaptiveStream: true, dynacast: false });
+    room
+      .on(LK.RoomEvent.TrackSubscribed, (track) => attachTrack(track))
+      .on(LK.RoomEvent.TrackUnsubscribed, (track) => detachTrack(track))
+      .on(LK.RoomEvent.ParticipantConnected, () => {
+        if (!haveVideo) setStatus('wait', 'Camera is connecting…', 'almost there');
+      })
+      .on(LK.RoomEvent.ParticipantDisconnected, () => {
+        if (!haveVideo) { setStatus('wait', 'Camera left', ''); }
+      })
+      .on(LK.RoomEvent.Reconnecting, () => setStatus('wait', 'Reconnecting…', ''))
+      .on(LK.RoomEvent.Reconnected, () => setStatus(haveVideo ? 'live' : 'wait', haveVideo ? 'Live' : 'Waiting for the camera…', ''))
+      .on(LK.RoomEvent.Disconnected, (reason) => {
+        haveVideo = false;
+        if (document.visibilityState === 'visible') {
+          setStatus('off', 'Disconnected', reason ? String(reason) : '');
+          showCenter('Disconnected', 'Tap to reconnect.', { spinner: false, retry: true });
+        }
+      });
+    try {
+      await room.connect(livekitURL, token);
+      // The camera may already be streaming (e.g. you re-opened the page): existing tracks fire TrackSubscribed.
+      if (!haveVideo) setStatus('wait', 'Waking the camera…', '');
+    } catch (e) {
+      console.error(e);
+      setStatus('off', 'Could not connect', '');
+      showCenter('Could not connect to the video service',
+        (e && e.message ? e.message + '. ' : '') + 'If this keeps happening, make a new private link in ShutterBird.',
+        { spinner: false, retry: true });
+    } finally {
+      connecting = false;
+    }
+  }
+
+  async function leaveRoom() {
+    clearTimeout(wakeTimer);
+    clearTimeout(offlineTimer);
+    const r = room;
+    room = null;
+    haveVideo = false;
+    if (r) { try { await r.disconnect(); } catch (e) {} }
+  }
+
+  async function start(reason) {
+    wakeSends = 0;
+    setStatus('wait', 'Waking the camera…', '');
+    showCenter('Waking the camera…', 'The camera phone has been asked to start. This usually takes a few seconds.');
+    sendWake(reason);
+    scheduleWakeResend();
+    scheduleOffline();
+    await joinRoom();
+  }
+
+  retryBtn.onclick = () => { leaveRoom().then(() => start('retry')); };
+
+  // Leaving the page (or switching apps) drops out of the room, which lets the camera stop a minute later.
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') {
+      leaveRoom();
+    } else {
+      start('back');
+    }
+  });
+  window.addEventListener('pagehide', () => { leaveRoom(); });
+
+  bottom.textContent = 'Close this page to let the camera stop streaming (about a minute later).';
+  start('open');
+})();
+</script>
+</body>
+</html>
