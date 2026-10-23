@@ -35,6 +35,20 @@
   @keyframes spin { to { transform: rotate(360deg); } }
   #bottom { position: fixed; left: 0; right: 0; bottom: 0; padding: 10px 14px calc(env(safe-area-inset-bottom) + 10px);
     font-size: 12px; color: #999; text-align: center; background: linear-gradient(rgba(0,0,0,0), rgba(0,0,0,.7)); }
+  #sound { position: fixed; left: 0; right: 0; bottom: calc(env(safe-area-inset-bottom) + 58px); display: flex;
+    justify-content: center; align-items: center; gap: 14px; padding: 0 16px; }
+  #sound.hidden { display: none; }
+  #soundOn { display: inline-flex; align-items: center; gap: 10px; font-size: 17px; padding: 14px 24px;
+    border-radius: 999px; box-shadow: 0 4px 18px rgba(0,0,0,.5); }
+  #mute { width: 46px; height: 46px; border-radius: 50%; padding: 0; font-size: 20px; background: rgba(255,255,255,.18); }
+  #mute.muted { background: #ff3b30; }
+  #volume { -webkit-appearance: none; appearance: none; width: min(55vw, 260px); height: 34px; background: transparent; }
+  #volume::-webkit-slider-runnable-track { height: 6px; border-radius: 3px; background: rgba(255,255,255,.35); }
+  #volume::-webkit-slider-thumb { -webkit-appearance: none; width: 28px; height: 28px; border-radius: 50%; background: #fff;
+    margin-top: -11px; box-shadow: 0 2px 8px rgba(0,0,0,.5); }
+  #volume::-moz-range-track { height: 6px; border-radius: 3px; background: rgba(255,255,255,.35); }
+  #volume::-moz-range-thumb { width: 28px; height: 28px; border-radius: 50%; background: #fff; border: 0; }
+  #nosound { font-size: 13px; color: #bbb; text-shadow: 0 1px 2px #000; }
 </style>
 </head>
 <body>
@@ -45,6 +59,12 @@
   <div class="big" id="centerTitle">Waking the camera…</div>
   <div class="muted" id="centerText">The camera phone has been asked to start. This usually takes a few seconds.</div>
   <button id="retry" style="display:none">Try again</button>
+</div>
+<div id="sound" class="hidden">
+  <button id="soundOn">🔊 Sound on</button>
+  <button id="mute" aria-label="Mute" style="display:none">🔊</button>
+  <input id="volume" type="range" min="0" max="1" step="0.05" value="1" aria-label="Volume" style="display:none">
+  <span id="nosound" style="display:none"></span>
 </div>
 <div id="bottom"></div>
 
@@ -70,6 +90,11 @@
   const retryBtn = document.getElementById('retry');
   const video = document.getElementById('video');
   const bottom = document.getElementById('bottom');
+  const soundBar = document.getElementById('sound');
+  const soundOnBtn = document.getElementById('soundOn');
+  const muteBtn = document.getElementById('mute');
+  const volumeEl = document.getElementById('volume');
+  const noSoundEl = document.getElementById('nosound');
 
   const WAKE_RESEND_SECONDS = 25;     // repeat the wake-up while nothing has arrived (at most a few times)
   const MAX_WAKE_RESENDS = 3;
@@ -81,6 +106,18 @@
   let wakeTimer = null;
   let offlineTimer = null;
   let connecting = false;
+
+  // ---- Sound: Safari only starts audio after a tap, and the volume lives in a Web Audio gain
+  // (an audio element's volume cannot be changed on iOS). ----
+  let audioTrack = null;        // the camera's microphone track, when it is sending one
+  let audioEl = null;
+  let soundOn = false;          // the tap has happened and playback is unlocked
+  let muted = false;
+  let volume = 1;
+  let noSoundTimer = null;      // the microphone arrives a moment after the picture; say "no sound" only once it is clearly not coming
+  let noSoundYet = false;
+  try { const v = parseFloat(localStorage.getItem('shutterbird-volume')); if (v >= 0 && v <= 1) volume = v; } catch (e) {}
+  volumeEl.value = String(volume);
 
   function setStatus(kind, text, detail) {
     dot.className = kind;
@@ -153,22 +190,103 @@
     }, OFFLINE_AFTER_SECONDS * 1000);
   }
 
+  // ---- Sound controls ----
+  function liveDetail() {
+    if (!audioTrack) return '';
+    if (!soundOn) return 'tap Sound on';
+    return muted ? 'muted' : 'sound on';
+  }
+
+  function applyVolume() {
+    if (audioTrack) audioTrack.setVolume(muted ? 0 : volume);
+  }
+
+  function updateSoundUI() {
+    clearTimeout(noSoundTimer);
+    if (haveVideo && !audioTrack && !noSoundYet) {
+      noSoundTimer = setTimeout(() => { noSoundYet = true; updateSoundUI(); }, 6000);
+    }
+    if (audioTrack) noSoundYet = false;
+    const show = haveVideo && (audioTrack || noSoundYet);
+    soundBar.classList.toggle('hidden', !show);
+    if (!show) return;
+    const unlocked = soundOn && room && room.canPlaybackAudio;
+    soundOnBtn.style.display = audioTrack && !unlocked ? '' : 'none';
+    muteBtn.style.display = unlocked && audioTrack ? '' : 'none';
+    volumeEl.style.display = unlocked && audioTrack ? '' : 'none';
+    noSoundEl.style.display = !audioTrack ? '' : 'none';
+    noSoundEl.textContent = !audioTrack ? 'No sound from the camera (its microphone is off or not allowed)' : '';
+    muteBtn.textContent = muted ? '🔇' : '🔊';
+    muteBtn.classList.toggle('muted', muted);
+    muteBtn.setAttribute('aria-label', muted ? 'Unmute' : 'Mute');
+    if (haveVideo) setStatus('live', 'Live', liveDetail());
+  }
+
+  async function enableSound() {
+    if (!room) return;
+    // "playback" is the media channel: like a video, it plays even with the silent switch on.
+    try { if (navigator.audioSession) navigator.audioSession.type = 'playback'; } catch (e) {}
+    try {
+      await room.startAudio();
+      soundOn = true;
+      applyVolume();
+    } catch (e) {
+      console.warn('sound could not start', e);
+      setStatus('live', 'Live', 'tap Sound on again');
+    }
+    updateSoundUI();
+  }
+
+  soundOnBtn.addEventListener('click', () => { enableSound(); });
+  muteBtn.addEventListener('click', () => { muted = !muted; applyVolume(); updateSoundUI(); });
+  volumeEl.addEventListener('input', () => {
+    volume = parseFloat(volumeEl.value);
+    if (muted && volume > 0) muted = false;
+    applyVolume();
+    try { localStorage.setItem('shutterbird-volume', String(volume)); } catch (e) {}
+    updateSoundUI();
+  });
+
   // ---- LiveKit room ----
   function attachTrack(track) {
+    if (track.kind === 'audio') {
+      audioTrack = track;
+      audioEl = track.attach();          // kept silent itself; the sound goes through Web Audio
+      audioEl.setAttribute('playsinline', '');
+      audioEl.style.display = 'none';
+      document.body.appendChild(audioEl);
+      applyVolume();
+      if (soundOn) {
+        // Already unlocked by an earlier tap (e.g. the page came back): no tap needed again.
+        room.startAudio().then(updateSoundUI).catch(() => { soundOn = false; updateSoundUI(); });
+      }
+      updateSoundUI();
+      return;
+    }
     if (track.kind !== 'video') return;
     track.attach(video);
     haveVideo = true;
     clearTimeout(wakeTimer);
     clearTimeout(offlineTimer);
     hideCenter();
-    setStatus('live', 'Live', '');
+    setStatus('live', 'Live', liveDetail());
     video.play().catch(() => {});
+    updateSoundUI();
   }
 
   function detachTrack(track) {
+    if (track.kind === 'audio') {
+      try { track.detach(); } catch (e) {}
+      if (audioEl && audioEl.parentNode) audioEl.parentNode.removeChild(audioEl);
+      audioEl = null;
+      audioTrack = null;
+      updateSoundUI();
+      return;
+    }
     if (track.kind !== 'video') return;
     track.detach(video);
     haveVideo = false;
+    updateSoundUI();
     setStatus('wait', 'Camera stopped', 'waiting…');
     showCenter('Camera stopped', 'Waiting for it to come back…');
     scheduleOffline();
@@ -177,10 +295,11 @@
   async function joinRoom() {
     if (connecting || (room && room.state === LK.ConnectionState.Connected)) return;
     connecting = true;
-    room = new LK.Room({ adaptiveStream: true, dynacast: false });
+    room = new LK.Room({ adaptiveStream: true, dynacast: false, webAudioMix: true });
     room
       .on(LK.RoomEvent.TrackSubscribed, (track) => attachTrack(track))
       .on(LK.RoomEvent.TrackUnsubscribed, (track) => detachTrack(track))
+      .on(LK.RoomEvent.AudioPlaybackStatusChanged, () => updateSoundUI())
       .on(LK.RoomEvent.ParticipantConnected, () => {
         if (!haveVideo) setStatus('wait', 'Camera is connecting…', 'almost there');
       })
@@ -191,6 +310,8 @@
       .on(LK.RoomEvent.Reconnected, () => setStatus(haveVideo ? 'live' : 'wait', haveVideo ? 'Live' : 'Waiting for the camera…', ''))
       .on(LK.RoomEvent.Disconnected, (reason) => {
         haveVideo = false;
+        audioTrack = null;
+        updateSoundUI();
         if (document.visibilityState === 'visible') {
           setStatus('off', 'Disconnected', reason ? String(reason) : '');
           showCenter('Disconnected', 'Tap to reconnect.', { spinner: false, retry: true });
@@ -217,6 +338,10 @@
     const r = room;
     room = null;
     haveVideo = false;
+    audioTrack = null;
+    if (audioEl && audioEl.parentNode) audioEl.parentNode.removeChild(audioEl);
+    audioEl = null;
+    updateSoundUI();
     if (r) { try { await r.disconnect(); } catch (e) {} }
   }
 
