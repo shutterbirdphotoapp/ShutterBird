@@ -1,0 +1,391 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="ShutterBird">
+<meta name="robots" content="noindex, nofollow">
+<title>ShutterBird Photos</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; min-height: 100%; background: #000; color: #eee;
+    font: 15px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  body { padding-bottom: calc(env(safe-area-inset-bottom) + 24px); }
+  #top { position: sticky; top: 0; z-index: 2; display: flex; align-items: center; gap: 12px;
+    padding: calc(env(safe-area-inset-top) + 10px) 14px 10px; background: rgba(0,0,0,.92);
+    backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px); }
+  #brand { font-weight: 700; letter-spacing: .2px; }
+  #live { margin-left: auto; display: inline-flex; align-items: center; gap: 8px; color: #fff;
+    background: #ff3b30; border: 0; border-radius: 999px; padding: 10px 16px; font: inherit; font-weight: 700;
+    text-decoration: none; }
+  #live.off { background: #333; color: #999; pointer-events: none; }
+  #live .dot { width: 8px; height: 8px; border-radius: 50%; background: #fff; }
+  main { padding: 10px 14px 0; }
+  h1 { font-size: 20px; margin: 6px 0 2px; }
+  .sub { color: #aaa; margin: 0 0 10px; line-height: 1.4; }
+  .note { background: #1c1c1e; border-radius: 12px; padding: 12px 14px; margin: 10px 0; line-height: 1.45; color: #ddd; }
+  .note.warn { border-left: 4px solid #ffcc00; }
+  .note.bad { border-left: 4px solid #ff453a; }
+  .note .spin { display: inline-block; width: 14px; height: 14px; border: 2px solid #444; border-top-color: #fff;
+    border-radius: 50%; animation: spin 1s linear infinite; vertical-align: -2px; margin-right: 8px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  #gallery { display: flex; overflow-x: auto; scroll-snap-type: x mandatory; gap: 10px;
+    -webkit-overflow-scrolling: touch; scrollbar-width: none; margin: 0 -14px; padding: 0 14px; }
+  #gallery::-webkit-scrollbar { display: none; }
+  .slide { flex: 0 0 100%; scroll-snap-align: center; scroll-snap-stop: always; }
+  .slide img { display: block; width: 100%; max-height: 68vh; object-fit: contain; background: #111; border-radius: 12px; }
+  .caption { display: flex; align-items: center; gap: 10px; margin-top: 8px; color: #bbb; font-size: 13px; }
+  .caption .save { margin-left: auto; font: inherit; font-weight: 600; color: #fff; background: #0a84ff; border: 0;
+    border-radius: 10px; padding: 8px 14px; }
+  #dots { display: flex; justify-content: center; gap: 6px; margin: 10px 0 4px; }
+  #dots span { width: 7px; height: 7px; border-radius: 50%; background: #444; }
+  #dots span.on { background: #fff; }
+  .hint { color: #777; font-size: 12px; text-align: center; margin: 4px 0 14px; }
+  h2 { font-size: 16px; margin: 22px 0 8px; color: #ccc; }
+  #recent { list-style: none; margin: 0; padding: 0; }
+  #recent li { display: flex; align-items: center; gap: 10px; padding: 10px 0; border-top: 1px solid #222; }
+  #recent li a { color: #fff; text-decoration: none; display: flex; align-items: center; gap: 10px; width: 100%; }
+  #recent .when { font-weight: 600; min-width: 64px; }
+  #recent .what { color: #aaa; flex: 1; }
+  #recent .count { color: #aaa; font-size: 13px; }
+  button.plain { font: inherit; color: #0a84ff; background: none; border: 0; padding: 6px 0; }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<div id="top">
+  <div id="brand">ShutterBird</div>
+  <a id="live" class="off" href="#"><span class="dot"></span>Watch live</a>
+</div>
+<main>
+  <h1 id="title">Visit</h1>
+  <p class="sub" id="subtitle"></p>
+  <div id="status" class="note"><span class="spin"></span>Loading the photos…</div>
+  <div id="gallery" class="hidden"></div>
+  <div id="dots" class="hidden"></div>
+  <p class="hint hidden" id="hint">Swipe for the next photo. Long-press a photo, or tap Save, to keep it on this phone.</p>
+  <h2 id="recentTitle" class="hidden">Recent visits</h2>
+  <ul id="recent"></ul>
+</main>
+
+<script>
+(function () {
+  'use strict';
+
+  // ---- Private link: everything after # (never sent to the web server) ----
+  function readParams() {
+    const params = new URLSearchParams(location.hash.replace(/^#/, ''));
+    return {
+      server: (params.get('s') || 'https://ntfy.sh').replace(/\/+$/, ''),
+      alertTopic: params.get('a') || '',
+      photosTopic: params.get('p') || '',
+      visit: params.get('v') || '',
+      at: parseInt(params.get('at') || '0', 10) || 0,
+      live: { u: params.get('u') || '', t: params.get('t') || '', n: params.get('n') || '', s: params.get('s') || '' }
+    };
+  }
+  let P = readParams();
+
+  const KEEP_HOURS = 3;                 // ntfy.sh keeps attachments for 3 hours
+  const WAIT_FOR_MORE_SECONDS = 180;    // how long after a visit the rest of the photos might still turn up
+  const $ = (id) => document.getElementById(id);
+  const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const timeText = (unix) => new Date(unix * 1000).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  const dayText = (unix) => new Date(unix * 1000).toLocaleDateString([], { weekday: 'short', day: 'numeric', month: 'short' });
+
+  // ---- "Watch live" goes to the live viewer page next to this one, with the same private details ----
+  function setUpLiveButton() {
+    const live = $('live');
+    if (P.live.u && P.live.t && P.live.n) {
+      let frag = 'u=' + encodeURIComponent(P.live.u) + '&t=' + encodeURIComponent(P.live.t) + '&n=' + encodeURIComponent(P.live.n);
+      if (P.live.s) frag += '&s=' + encodeURIComponent(P.live.s);
+      live.href = 'index.html#' + frag;
+      live.classList.remove('off');
+    } else {
+      live.removeAttribute('href');
+      live.classList.add('off');
+      live.title = 'Live view is not set up';
+    }
+  }
+
+  // ---- ntfy: read a topic's recent messages without staying connected ----
+  async function pollMessages(topic, since, tags) {
+    let url = P.server + '/' + encodeURIComponent(topic) + '/json?poll=1&since=' + encodeURIComponent(since);
+    if (tags) url += '&tags=' + encodeURIComponent(tags);
+    const r = await fetch(url, { cache: 'no-store' });
+    if (!r.ok) throw new Error('ntfy answered ' + r.status);
+    const text = await r.text();
+    const out = [];
+    for (const line of text.split('\n')) {
+      const t = line.trim();
+      if (!t) continue;
+      try {
+        const m = JSON.parse(t);
+        if (m && m.event === 'message') out.push(m);
+      } catch (e) { /* ignore a bad line */ }
+    }
+    return out;
+  }
+
+  function parseIndex(m) {
+    try { return JSON.parse(m.message || ''); } catch (e) { return null; }
+  }
+
+  // ---- State for the visit on screen ----
+  const state = { photos: [], urls: [], alertShown: false, bundleShown: false, pollTimer: null, pollUntil: 0 };
+
+  function status(html, kind) {
+    const el = $('status');
+    if (!html) { el.classList.add('hidden'); return; }
+    el.className = 'note' + (kind ? ' ' + kind : '');
+    el.innerHTML = html;
+    el.classList.remove('hidden');
+  }
+
+  function revokeAll() {
+    for (const u of state.urls) { try { URL.revokeObjectURL(u); } catch (e) {} }
+    state.urls = [];
+  }
+
+  function render() {
+    const gallery = $('gallery');
+    const dots = $('dots');
+    gallery.innerHTML = '';
+    dots.innerHTML = '';
+    state.photos.forEach((photo, i) => {
+      const slide = document.createElement('div');
+      slide.className = 'slide';
+      const img = document.createElement('img');
+      img.src = photo.url;
+      img.alt = photo.label;
+      slide.appendChild(img);
+      const cap = document.createElement('div');
+      cap.className = 'caption';
+      cap.innerHTML = '<span>' + esc(photo.label) + '</span>';
+      const save = document.createElement('button');
+      save.className = 'save';
+      save.textContent = 'Save';
+      save.addEventListener('click', () => savePhoto(photo));
+      cap.appendChild(save);
+      slide.appendChild(cap);
+      gallery.appendChild(slide);
+      const dot = document.createElement('span');
+      if (i === 0) dot.className = 'on';
+      dots.appendChild(dot);
+    });
+    const any = state.photos.length > 0;
+    gallery.classList.toggle('hidden', !any);
+    dots.classList.toggle('hidden', state.photos.length < 2);
+    $('hint').classList.toggle('hidden', !any);
+  }
+
+  $('gallery').addEventListener('scroll', () => {
+    const g = $('gallery');
+    const i = Math.round(g.scrollLeft / Math.max(1, g.clientWidth));
+    [...$('dots').children].forEach((d, k) => d.classList.toggle('on', k === i));
+  }, { passive: true });
+
+  async function savePhoto(photo) {
+    try {
+      const file = new File([photo.blob], photo.file, { type: 'image/jpeg' });
+      if (navigator.canShare && navigator.canShare({ files: [file] })) {
+        await navigator.share({ files: [file], title: photo.file });
+        return;
+      }
+    } catch (e) {
+      if (e && e.name === 'AbortError') return;   // the share sheet was dismissed
+    }
+    // No share sheet: open the picture by itself, where a long-press saves it.
+    window.open(photo.url, '_blank');
+  }
+
+  function addPhoto(blob, label, file, front) {
+    const url = URL.createObjectURL(blob);
+    state.urls.push(url);
+    const entry = { blob, url, label, file };
+    if (front) state.photos.unshift(entry); else state.photos.push(entry);
+  }
+
+  // ---- Loading one visit ----
+  async function loadVisit() {
+    const now = Math.floor(Date.now() / 1000);
+    const expired = P.at > 0 && now - P.at > KEEP_HOURS * 3600;
+    $('title').textContent = P.at ? 'Visit at ' + timeText(P.at) : 'Visit';
+    $('subtitle').textContent = P.at ? dayText(P.at) : '';
+
+    if (expired) {
+      status('These photos are no longer online - ntfy keeps them for ' + KEEP_HOURS + ' hours. They are still in the Shutterbird album on the camera phone.', 'warn');
+      return;
+    }
+    const since = String(Math.max(1, (P.at || now) - 120));
+
+    // The visit's bundle and its alert, side by side.
+    const [bundleResult, alertResult] = await Promise.allSettled([
+      P.photosTopic ? pollMessages(P.photosTopic, since, 'v-' + P.visit) : Promise.resolve([]),
+      P.alertTopic ? pollMessages(P.alertTopic, since) : Promise.resolve([])
+    ]);
+    if (bundleResult.status === 'rejected' && alertResult.status === 'rejected') {
+      status('Could not reach ntfy (' + esc(bundleResult.reason && bundleResult.reason.message || 'no connection') + '). <button class="plain" onclick="location.reload()">Try again</button>', 'bad');
+      return;
+    }
+    const bundles = bundleResult.status === 'fulfilled' ? bundleResult.value : [];
+    const alerts = alertResult.status === 'fulfilled' ? alertResult.value : [];
+
+    const alert = alerts.find((m) => m.click && m.click.indexOf('v=' + P.visit) >= 0);
+    if (alert && alert.message) {
+      $('subtitle').textContent = dayText(alert.time || P.at) + ' · ' + alert.message;
+    }
+    const bundle = bundles.find((m) => parseIndex(m));
+    if (bundle) {
+      await showBundle(bundle, alert);
+      return;
+    }
+    // No bundle yet: the alert photo straight away, then keep looking for the rest.
+    if (alert && alert.attachment && alert.attachment.url && !state.alertShown) {
+      try {
+        const r = await fetch(alert.attachment.url);
+        if (r.ok) {
+          addPhoto(await r.blob(), 'Alert photo', 'shutterbird-' + P.visit + '-alert.jpg', true);
+          state.alertShown = true;
+          render();
+        }
+      } catch (e) { /* the gallery just stays empty for now */ }
+    }
+    if (now - (P.at || now) < WAIT_FOR_MORE_SECONDS) {
+      status('<span class="spin"></span>More photos are on the way - the camera phone is still finishing this visit’s burst.');
+      state.pollUntil = (P.at || now) + WAIT_FOR_MORE_SECONDS;
+      state.pollTimer = setTimeout(pollAgain, 5000);
+    } else if (!alert && alerts.length === 0 && bundles.length === 0) {
+      status('No photos were found for this visit. If it was more than ' + KEEP_HOURS + ' hours ago they have expired; they are still in the Shutterbird album on the camera phone.', 'warn');
+    } else {
+      status('The rest of this visit’s photos did not make it online (the camera phone was out of its ntfy allowance, or offline). They are in the Shutterbird album on the camera phone.', 'warn');
+    }
+  }
+
+  async function pollAgain() {
+    state.pollTimer = null;
+    const now = Math.floor(Date.now() / 1000);
+    try {
+      const since = String(Math.max(1, (P.at || now) - 120));
+      const bundles = await pollMessages(P.photosTopic, since, 'v-' + P.visit);
+      const bundle = bundles.find((m) => parseIndex(m));
+      if (bundle) {
+        await showBundle(bundle, null);
+        return;
+      }
+    } catch (e) { /* try again shortly */ }
+    if (now < state.pollUntil) {
+      state.pollTimer = setTimeout(pollAgain, 5000);
+    } else {
+      status('The rest of this visit’s photos did not make it online. They are in the Shutterbird album on the camera phone.', 'warn');
+    }
+  }
+
+  async function showBundle(bundle, alert) {
+    const index = parseIndex(bundle) || {};
+    if (index.skipped) {
+      status('Only the alert photo made it online this time: ' + esc(index.skipped) + '. The rest are in the Shutterbird album on the camera phone.', 'warn');
+      return;
+    }
+    const att = bundle.attachment;
+    const now = Math.floor(Date.now() / 1000);
+    if (!att || !att.url || (att.expires && att.expires < now)) {
+      status('These photos are no longer online - ntfy keeps them for ' + KEEP_HOURS + ' hours. They are still in the Shutterbird album on the camera phone.', 'warn');
+      return;
+    }
+    status('<span class="spin"></span>Loading ' + (index.n || '') + ' photos…');
+    let buffer;
+    try {
+      const r = await fetch(att.url);
+      if (!r.ok) throw new Error('ntfy answered ' + r.status);
+      buffer = await r.arrayBuffer();
+    } catch (e) {
+      status('Could not download the photos (' + esc(e.message) + '). They may have expired; they are still in the Shutterbird album on the camera phone. <button class="plain" onclick="location.reload()">Try again</button>', 'bad');
+      return;
+    }
+    const parts = Array.isArray(index.p) ? index.p : [];
+    const hasFirst = parts.some((p) => p.i === 0);
+    // Rebuild the gallery from the bundle (sharpest first); keep the alert photo only if the burst's first photo isn't in it.
+    const keepAlert = state.alertShown && !hasFirst ? state.photos[0] : null;
+    state.photos = [];
+    if (keepAlert) state.photos.push(keepAlert);
+    parts.forEach((p, k) => {
+      if (typeof p.o !== 'number' || typeof p.l !== 'number' || p.o < 0 || p.o + p.l > buffer.byteLength) return;
+      const blob = new Blob([buffer.slice(p.o, p.o + p.l)], { type: 'image/jpeg' });
+      const label = (k === 0 ? 'Sharpest' : 'Photo ' + (k + 1)) + ' of ' + parts.length + (p.i === 0 ? ' · the alert photo' : '');
+      addPhoto(blob, label, 'shutterbird-' + P.visit + '-' + (k + 1) + '.jpg', false);
+    });
+    render();
+    state.bundleShown = true;
+    let line = '';
+    if (index.species) line += esc(index.species);
+    if (index.orientation) line += (line ? ' · ' : '') + esc(index.orientation);
+    if (index.px) line += (line ? ' · ' : '') + index.px + ' px copies';
+    const expiresIn = att.expires ? Math.max(0, Math.round((att.expires - now) / 60)) : null;
+    if (expiresIn !== null) line += (line ? ' · ' : '') + 'online for ' + (expiresIn >= 60 ? Math.round(expiresIn / 60) + ' h' : expiresIn + ' min') + ' more';
+    status(line || '');
+    if (!line) status('');
+  }
+
+  // ---- The last three hours of visits, from the photos topic ----
+  async function loadRecent() {
+    if (!P.photosTopic) return;
+    let messages;
+    try {
+      messages = await pollMessages(P.photosTopic, KEEP_HOURS + 'h');
+    } catch (e) { return; }
+    const items = messages.map((m) => ({ m, index: parseIndex(m) })).filter((x) => x.index && x.index.v)
+      .sort((a, b) => (b.m.time || 0) - (a.m.time || 0));
+    const list = $('recent');
+    list.innerHTML = '';
+    for (const { m, index } of items) {
+      if (index.v === P.visit) continue;
+      const li = document.createElement('li');
+      const a = document.createElement('a');
+      const frag = new URLSearchParams(location.hash.replace(/^#/, ''));
+      frag.set('v', index.v);
+      frag.set('at', String(index.t || m.time || 0));
+      a.href = '#' + frag.toString();
+      const what = index.skipped ? 'alert photo only' : (index.species || 'bird');
+      a.innerHTML = '<span class="when">' + esc(timeText(index.t || m.time)) + '</span><span class="what">' + esc(what) + '</span>'
+        + '<span class="count">' + (index.skipped ? '' : (index.n || 0) + ' photo' + (index.n === 1 ? '' : 's')) + '</span>';
+      li.appendChild(a);
+      list.appendChild(li);
+    }
+    $('recentTitle').classList.toggle('hidden', items.length === 0 || (items.length === 1 && items[0].index.v === P.visit));
+    if (!P.visit) {
+      $('title').textContent = 'Recent visits';
+      $('subtitle').textContent = items.length ? 'The last ' + KEEP_HOURS + ' hours. Tap one to see its photos.' : 'No visits in the last ' + KEEP_HOURS + ' hours.';
+      status('');
+    }
+  }
+
+  async function start() {
+    if (state.pollTimer) { clearTimeout(state.pollTimer); state.pollTimer = null; }
+    revokeAll();
+    state.photos = []; state.alertShown = false; state.bundleShown = false;
+    render();
+    P = readParams();
+    setUpLiveButton();
+    if (!P.photosTopic && !P.alertTopic) {
+      $('title').textContent = 'ShutterBird Photos';
+      status('This page needs the private link from the ShutterBird app (Settings → Photos page → Copy photos page link), or a tap on a bird alert.', 'warn');
+      return;
+    }
+    if (P.visit) {
+      loadVisit().catch((e) => status('Something went wrong: ' + esc(e.message), 'bad'));
+    } else {
+      status('<span class="spin"></span>Looking for recent visits…');
+    }
+    loadRecent();
+    window.scrollTo(0, 0);
+  }
+
+  window.addEventListener('hashchange', start);
+  start();
+})();
+</script>
+</body>
+</html>
